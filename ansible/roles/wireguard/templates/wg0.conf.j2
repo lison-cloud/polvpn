@@ -1,0 +1,14 @@
+# {{ ansible_managed }}
+[Interface]
+Address = {{ wg_server_address }}/24
+ListenPort = {{ wg_port }}
+MTU = {{ wg_mtu }}
+PrivateKey = {{ wg_keys[wg_config_dir ~ '/server.key'] }}
+{% for client in wg_clients | sort(attribute='id') %}
+
+# {{ client.name }}
+[Peer]
+PublicKey = {{ wg_keys[wg_clients_dir ~ '/' ~ client.name ~ '/public.key'] }}
+PresharedKey = {{ wg_keys[wg_clients_dir ~ '/' ~ client.name ~ '/preshared.key'] }}
+AllowedIPs = {{ wg_net_prefix }}.{{ client.id | int }}/32
+{% endfor %}

@@ -1,0 +1,9 @@
+---
+- name: Validate settings
+  ansible.builtin.import_tasks: validate.yml
+
+- name: Install and configure the WireGuard server
+  ansible.builtin.import_tasks: server.yml
+
+- name: Copy client configs to the control machine
+  ansible.builtin.import_tasks: local.yml

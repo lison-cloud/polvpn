@@ -1,0 +1,12 @@
+// {{ ansible_managed }}
+// Install security updates only: drop the Debian default origin list
+// (50unattended-upgrades also includes stable point releases) and set our own.
+#clear Unattended-Upgrade::Origins-Pattern;
+Unattended-Upgrade::Origins-Pattern {
+        "origin=Debian,codename=${distro_codename}-security,label=Debian-Security";
+        "origin=Debian,codename=${distro_codename},label=Debian-Security";
+};
+Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";
+Unattended-Upgrade::Remove-Unused-Dependencies "true";
+Unattended-Upgrade::Automatic-Reboot "{{ base_unattended_reboot | bool | lower }}";
+Unattended-Upgrade::Automatic-Reboot-Time "04:00";

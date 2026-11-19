@@ -1,0 +1,171 @@
+---
+# wireguard-tools recommends wireguard-dkms on systems without a packaged kernel
+# providing wireguard-modules; Debian 12's kernel has WireGuard built in, so skip recommends.
+- name: Install WireGuard, QR encoder and nftables
+  ansible.builtin.apt:
+    name:
+      - wireguard-tools
+      - qrencode
+      - nftables
+    state: present
+    install_recommends: false
+    lock_timeout: 600
+
+- name: Persist IPv4 forwarding
+  ansible.builtin.copy:
+    dest: /etc/sysctl.d/99-polvpn.conf
+    content: |
+      # Managed by polvpn (Ansible). Sorted last so it wins over image defaults.
+      net.ipv4.ip_forward = 1
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Read current IPv4 forwarding state
+  ansible.builtin.slurp:
+    src: /proc/sys/net/ipv4/ip_forward
+  register: wg_ip_forward
+
+- name: Enable IPv4 forwarding now
+  ansible.builtin.command: sysctl -w net.ipv4.ip_forward=1
+  when: (wg_ip_forward.content | b64decode | trim) != '1'
+  changed_when: true
+
+- name: Create WireGuard directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+  loop: "{{ [wg_config_dir, wg_clients_dir] + (wg_client_names | map('regex_replace', '^', wg_clients_dir ~ '/') | list) }}"
+
+# Keys are generated once on the server and never regenerated (creates:).
+- name: Generate server private key
+  ansible.builtin.shell: umask 077 && wg genkey > server.key.tmp && mv server.key.tmp server.key
+  args:
+    chdir: "{{ wg_config_dir }}"
+    creates: "{{ wg_config_dir }}/server.key"
+
+- name: Derive server public key
+  ansible.builtin.shell: umask 077 && wg pubkey < server.key > server.pub
+  args:
+    chdir: "{{ wg_config_dir }}"
+    creates: "{{ wg_config_dir }}/server.pub"
+
+- name: Generate client private keys
+  ansible.builtin.shell: umask 077 && wg genkey > private.key.tmp && mv private.key.tmp private.key
+  args:
+    chdir: "{{ wg_clients_dir }}/{{ item }}"
+    creates: "{{ wg_clients_dir }}/{{ item }}/private.key"
+  loop: "{{ wg_client_names }}"
+
+- name: Derive client public keys
+  ansible.builtin.shell: umask 077 && wg pubkey < private.key > public.key
+  args:
+    chdir: "{{ wg_clients_dir }}/{{ item }}"
+    creates: "{{ wg_clients_dir }}/{{ item }}/public.key"
+  loop: "{{ wg_client_names }}"
+
+- name: Generate client preshared keys
+  ansible.builtin.shell: umask 077 && wg genpsk > preshared.key.tmp && mv preshared.key.tmp preshared.key
+  args:
+    chdir: "{{ wg_clients_dir }}/{{ item }}"
+    creates: "{{ wg_clients_dir }}/{{ item }}/preshared.key"
+  loop: "{{ wg_client_names }}"
+
+- name: Read key material
+  ansible.builtin.slurp:
+    src: "{{ item }}"
+  loop: >-
+    {{ [wg_config_dir ~ '/server.key', wg_config_dir ~ '/server.pub']
+       + (wg_client_names | product(['private.key', 'public.key', 'preshared.key'])
+          | map('join', '/') | map('regex_replace', '^', wg_clients_dir ~ '/') | list) }}
+  register: wg_keyfiles
+  no_log: true
+
+- name: Index key material by path
+  ansible.builtin.set_fact:
+    wg_keys: >-
+      {{ dict(wg_keyfiles.results | map(attribute='item')
+              | zip(wg_keyfiles.results | map(attribute='content') | map('b64decode') | map('trim'))) }}
+  no_log: true
+
+- name: Find client directories on the server
+  ansible.builtin.find:
+    paths: "{{ wg_clients_dir }}"
+    file_type: directory
+  register: wg_server_client_dirs
+
+- name: Delete key material of removed clients
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: absent
+  loop: "{{ wg_server_client_dirs.files }}"
+  loop_control:
+    label: "{{ item.path | basename }}"
+  when: (item.path | basename) not in wg_client_names
+
+- name: Render server config
+  ansible.builtin.template:
+    src: wg0.conf.j2
+    dest: "{{ wg_config_dir }}/wg0.conf"
+    owner: root
+    group: root
+    mode: "0600"
+  diff: false
+  notify: Apply WireGuard config
+
+- name: Render client configs
+  ansible.builtin.template:
+    src: client.conf.j2
+    dest: "{{ wg_clients_dir }}/{{ item.name }}/{{ item.name }}.conf"
+    owner: root
+    group: root
+    mode: "0600"
+  diff: false
+  loop: "{{ wg_clients }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+# Regenerate a client's QR codes when they are missing or older than its config.
+- name: Render client QR codes
+  ansible.builtin.shell: |
+    set -eu
+    umask 077
+    if [ ! -s {{ item.name }}.png ] || [ ! -s {{ item.name }}.qr.txt ] ||
+       [ {{ item.name }}.conf -nt {{ item.name }}.png ] || [ {{ item.name }}.conf -nt {{ item.name }}.qr.txt ]; then
+      qrencode -t png -o {{ item.name }}.png -r {{ item.name }}.conf
+      qrencode -t ansiutf8 -o {{ item.name }}.qr.txt -r {{ item.name }}.conf
+      echo rendered
+    fi
+  args:
+    chdir: "{{ wg_clients_dir }}/{{ item.name }}"
+  loop: "{{ wg_clients }}"
+  loop_control:
+    label: "{{ item.name }}"
+  register: wg_qr
+  changed_when: "'rendered' in wg_qr.stdout"
+
+- name: Configure NAT (nftables)
+  ansible.builtin.template:
+    src: nftables.conf.j2
+    dest: /etc/nftables.conf
+    owner: root
+    group: root
+    mode: "0755"
+    validate: /usr/sbin/nft -c -f %s
+  notify: Reload nftables
+
+- name: Enable nftables
+  ansible.builtin.systemd_service:
+    name: nftables
+    enabled: true
+    state: started
+
+- name: Enable and start WireGuard
+  ansible.builtin.systemd_service:
+    name: wg-quick@wg0
+    enabled: true
+    state: started
+  when: wg_manage_service | bool

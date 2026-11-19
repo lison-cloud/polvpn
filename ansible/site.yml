@@ -1,0 +1,19 @@
+---
+- name: Deploy polvpn WireGuard servers
+  hosts: vpn
+  become: true
+  gather_facts: false
+
+  pre_tasks:
+    - name: Wait for the freshly booted VM to accept SSH and sudo
+      ansible.builtin.wait_for_connection:
+        delay: 0
+        sleep: 5
+        timeout: 300
+
+    - name: Gather facts
+      ansible.builtin.setup:
+
+  roles:
+    - role: base
+    - role: wireguard

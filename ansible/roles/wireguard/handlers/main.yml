@@ -1,0 +1,25 @@
+---
+# Peer changes (the common case: adding/removing clients) are applied with
+# `systemctl reload`, which runs `wg syncconf` and keeps existing sessions up.
+# Interface-level changes (address, MTU) are not covered by syncconf, so the
+# interface is restarted only when those differ from the live state.
+- name: Apply WireGuard config
+  ansible.builtin.shell: |
+    set -euo pipefail
+    if ! systemctl is-active --quiet wg-quick@wg0; then
+      systemctl restart wg-quick@wg0
+    elif [ "$(cat /sys/class/net/wg0/mtu)" != "{{ wg_mtu }}" ] ||
+         ! ip -4 -o addr show dev wg0 | grep -qF " {{ wg_server_address }}/24 "; then
+      systemctl restart wg-quick@wg0
+    else
+      systemctl reload wg-quick@wg0
+    fi
+  args:
+    executable: /bin/bash
+  changed_when: true
+  when: wg_manage_service | bool
+
+- name: Reload nftables
+  ansible.builtin.systemd_service:
+    name: nftables
+    state: reloaded

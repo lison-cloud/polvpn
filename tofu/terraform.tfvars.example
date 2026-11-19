@@ -1,0 +1,6 @@
+# Copy to terraform.tfvars (the polvpn wrapper writes this file for you).
+project_id = "my-gcp-project-id"
+
+# Servers are normally managed by the wrapper in servers.auto.tfvars.json:
+#   {"servers": {"fra": {"zone": "europe-west3-a"}}}
+# admin_cidrs is passed by the wrapper on the command line (your public IP /32).

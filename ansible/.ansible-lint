@@ -1,0 +1,10 @@
+---
+profile: production
+offline: true
+exclude_paths:
+  - inventory/
+skip_list:
+  # The shared polvpn contract fixes user-facing variable names as wg_* (wg_clients,
+  # wg_port from the OpenTofu inventory, ...); the role keeps that prefix for its
+  # internal facts too instead of the role-name prefix "wireguard_".
+  - var-naming[no-role-prefix]

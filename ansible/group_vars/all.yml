@@ -1,0 +1,34 @@
+---
+# polvpn user-editable settings. Applied to every server in the inventory.
+# Per-server overrides can go in host_vars/<server>.yml (e.g. a different client list).
+
+# VPN clients (devices). One WireGuard peer per entry.
+#   name: used for file names (clients/<server>/<name>.conf/.png/.qr.txt);
+#         letters, digits, "_" and "-" only, max 32 characters.
+#   id:   host octet of the client's tunnel address inside wg_subnet (2-254, unique).
+#         Changing an id keeps the client's keys; only its address changes.
+# Removing an entry revokes the client: its peer is removed from the server, its
+# keys are deleted on the server and its local files under clients/<server>/ are deleted.
+wg_clients:
+  - name: laptop
+    id: 2
+  - name: phone
+    id: 3
+
+# Tunnel subnet. Must be an IPv4 /24 ending in .0; the server uses .1.
+wg_subnet: 10.66.66.0/24
+
+# DNS servers pushed to clients.
+wg_dns:
+  - 1.1.1.1
+  - 1.0.0.1
+
+# Tunnel MTU for server and clients. GCP VPC MTU is 1460; WireGuard over IPv4 adds
+# 60 bytes (80 over IPv6), so 1380 leaves headroom for clients on IPv6 or PPPoE paths.
+wg_mtu: 1380
+
+# UDP listen port. OpenTofu sets wg_port per host in the inventory, which overrides this.
+wg_port: 51820
+
+# Keepalive (seconds) sent by clients so NAT mappings stay open.
+wg_persistent_keepalive: 25

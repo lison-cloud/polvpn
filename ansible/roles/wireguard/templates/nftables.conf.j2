@@ -1,0 +1,24 @@
+#!/usr/sbin/nft -f
+# {{ ansible_managed }}
+# Only the polvpn tables are (re)defined; other tables are left alone
+# (the "table X / delete table X / table X {...}" idiom replaces them atomically).
+
+table ip polvpn_nat
+delete table ip polvpn_nat
+table ip polvpn_nat {
+	chain postrouting {
+		type nat hook postrouting priority srcnat; policy accept;
+		ip saddr {{ wg_subnet }} oifname "{{ wg_egress_interface }}" masquerade
+	}
+}
+
+table inet polvpn_filter
+delete table inet polvpn_filter
+table inet polvpn_filter {
+	chain forward {
+		type filter hook forward priority mangle; policy accept;
+		# Clamp TCP MSS to the path MTU for tunneled traffic.
+		iifname "wg0" tcp flags & (syn | rst) == syn tcp option maxseg size set rt mtu
+		oifname "wg0" tcp flags & (syn | rst) == syn tcp option maxseg size set rt mtu
+	}
+}

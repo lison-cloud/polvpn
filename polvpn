@@ -1,0 +1,707 @@
+#!/usr/bin/env bash
+# polvpn - deploy a personal WireGuard VPN server in any Google Cloud zone.
+#
+# Every tool (tofu, ansible, gcloud, ssh) runs inside the toolbox image
+# built from tools/Dockerfile, with this directory mounted at /work.
+# Host requirements: bash >= 4.4, docker, coreutils, curl.
+
+# Needs bash >= 4.4 (mapfile, empty arrays under set -u). Kept bash 3.2 compatible.
+if [ -z "${BASH_VERSION:-}" ]; then
+  echo "error: polvpn must be run with bash (>= 4.4): ./polvpn or bash ./polvpn" >&2
+  exit 1
+fi
+if [ "${BASH_VERSINFO[0]}" -lt 4 ] || { [ "${BASH_VERSINFO[0]}" -eq 4 ] && [ "${BASH_VERSINFO[1]}" -lt 4 ]; }; then
+  {
+    echo "error: polvpn needs bash 4.4 or newer; this is bash $BASH_VERSION ($BASH)."
+    echo "On macOS (which ships bash 3.2): run 'brew install bash', then make sure the Homebrew"
+    echo "bash comes first in PATH (./polvpn uses the first bash in PATH), or run it explicitly:"
+    echo "  \"\$(brew --prefix)/bin/bash\" ./polvpn ..."
+  } >&2
+  exit 1
+fi
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+readonly ROOT
+readonly IMAGE_REPO="polvpn-toolbox"
+readonly SECRETS="$ROOT/.secrets"
+readonly TF_DIR="$ROOT/tofu"
+readonly ANSIBLE_DIR="$ROOT/ansible"
+readonly CLIENTS_DIR="$ROOT/clients"
+readonly CACHE_DIR="$ROOT/.cache"
+readonly TFVARS="$TF_DIR/terraform.tfvars"
+# Overridable for testing; must stay inside $ROOT for tofu to see it.
+SERVERS_JSON="${POLVPN_SERVERS_JSON:-$TF_DIR/servers.auto.tfvars.json}"
+readonly SERVERS_JSON
+readonly SSH_KEY_REL=".secrets/polvpn_ed25519"
+readonly SA_KEY="$SECRETS/gcp-sa.json"
+readonly ADC_FILE="$SECRETS/gcloud/application_default_credentials.json"
+
+IMAGE=""          # set by image_tag
+SKIP_CREDS=0      # login runs without credential env vars
+
+# ---------------------------------------------------------------- helpers ---
+
+if [[ -t 2 ]]; then
+  C_RED=$'\e[31m' C_YEL=$'\e[33m' C_BLU=$'\e[1;34m' C_OFF=$'\e[0m'
+else
+  C_RED="" C_YEL="" C_BLU="" C_OFF=""
+fi
+
+info() { printf '%s==>%s %s\n' "$C_BLU" "$C_OFF" "$*" >&2; }
+warn() { printf '%swarning:%s %s\n' "$C_YEL" "$C_OFF" "$*" >&2; }
+die()  { printf '%serror:%s %s\n' "$C_RED" "$C_OFF" "$*" >&2; exit 1; }
+
+sha256() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum | cut -d' ' -f1
+  else
+    shasum -a 256 | cut -d' ' -f1
+  fi
+}
+
+valid_name()    { [[ $1 =~ ^[a-z][a-z0-9-]{0,19}$ && $1 != *- ]]; }
+valid_zone()    { [[ $1 =~ ^[a-z]+-[a-z]+[0-9]+-[a-z]$ ]]; }
+# Only families that run the x86 debian-12 image with a pd-standard boot disk.
+valid_machine() { [[ $1 =~ ^(e2|n1|n2|n2d)-[a-z0-9-]*[a-z0-9]$ ]]; }
+valid_client()  { [[ $1 =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]*$ ]]; }
+valid_project() { [[ $1 =~ ^[a-z][a-z0-9-]{4,28}[a-z0-9]$ ]]; }
+
+valid_ipv4() {
+  local ip=$1 o
+  [[ $ip =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+  for o in "${BASH_REMATCH[@]:1}"; do
+    ((10#$o <= 255)) || return 1
+  done
+}
+
+valid_cidr() {
+  local c=$1
+  if [[ $c == */* ]]; then
+    local addr=${c%/*} len=${c#*/}
+    [[ $len =~ ^[0-9]{1,3}$ ]] || return 1
+    if valid_ipv4 "$addr"; then ((10#$len <= 32)); return; fi
+    [[ $addr =~ ^[0-9a-fA-F:]+$ && $addr == *:* ]] && ((10#$len <= 128))
+  else
+    return 1
+  fi
+}
+
+need_arg() { # need_arg <count-wanted> <count-got> <usage>
+  (($2 >= $1)) || die "usage: polvpn $3"
+}
+
+confirm_tty() {
+  [[ -t 0 ]] || die "this command needs an interactive terminal (or set POLVPN_ASSUME_YES=1)"
+}
+
+# ----------------------------------------------------------------- docker ---
+
+require_docker() {
+  command -v docker >/dev/null 2>&1 ||
+    die "docker not found. Install Docker (https://docs.docker.com/get-docker/) and retry."
+  docker info >/dev/null 2>&1 ||
+    die "cannot talk to the Docker daemon. Is it running, and can your user run 'docker ps' without sudo?"
+}
+
+image_tag() {
+  [[ -f $ROOT/tools/Dockerfile ]] || die "missing $ROOT/tools/Dockerfile"
+  local h
+  h="$({ cat "$ROOT/tools/Dockerfile"; printf 'uid=%s gid=%s\n' "$(id -u)" "$(id -g)"; } | sha256)"
+  IMAGE="$IMAGE_REPO:${h:0:12}"
+}
+
+ensure_image() {
+  require_docker
+  image_tag
+  if [[ ${POLVPN_REBUILD:-0} != 1 ]] && docker image inspect "$IMAGE" >/dev/null 2>&1; then
+    return 0
+  fi
+  info "Building toolbox image $IMAGE (first build takes a few minutes)"
+  docker build \
+    --build-arg "PUID=$(id -u)" --build-arg "PGID=$(id -g)" \
+    --label "polvpn.dockerfile-hash=${IMAGE#*:}" \
+    -t "$IMAGE" - <"$ROOT/tools/Dockerfile" >&2 ||
+    die "toolbox image build failed"
+  # Drop outdated toolbox images (best effort).
+  local old
+  while IFS= read -r old; do
+    [[ -n $old && $old != "$IMAGE" ]] && docker rmi "$old" >/dev/null 2>&1 || true
+  done < <(docker image ls "$IMAGE_REPO" --format '{{.Repository}}:{{.Tag}}' 2>/dev/null)
+}
+
+project_id() { # prints project_id from terraform.tfvars, or nothing
+  [[ -f $TFVARS ]] || return 0
+  sed -n 's/^[[:space:]]*project_id[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$TFVARS" | head -n1
+}
+
+# docker_run <tty|notty> <workdir> <cmd...>
+#   tty   : interactive (-i, plus -t when stdin and stdout are terminals)
+#   notty : plain pipes (-i so stdin can be fed), safe for capturing output
+docker_run() {
+  local mode=$1 wd=$2
+  shift 2
+  local -a args=(run --rm -i --init --hostname polvpn
+    --user "$(id -u):$(id -g)"
+    -v "$ROOT:/work" -w "$wd"
+    -e "ANSIBLE_CONFIG=/work/ansible/ansible.cfg"
+    -e "ANSIBLE_COLLECTIONS_PATH=/work/.cache/ansible/collections:/usr/share/ansible/collections"
+    -e "ANSIBLE_ROLES_PATH=/work/ansible/roles:/work/.cache/ansible/roles")
+  if [[ $mode == tty && -t 0 && -t 1 ]]; then
+    args+=(-t -e "TERM=${TERM:-xterm}")
+  fi
+  local project
+  project="$(project_id)"
+  [[ -n $project ]] && args+=(-e "CLOUDSDK_CORE_PROJECT=$project")
+  if ((SKIP_CREDS == 0)); then
+    if [[ -f $SA_KEY ]]; then
+      args+=(-e "GOOGLE_APPLICATION_CREDENTIALS=/work/.secrets/gcp-sa.json"
+        -e "CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE=/work/.secrets/gcp-sa.json")
+    elif [[ -f $ADC_FILE ]]; then
+      args+=(-e "GOOGLE_APPLICATION_CREDENTIALS=/work/.secrets/gcloud/application_default_credentials.json")
+    fi
+  fi
+  docker "${args[@]}" "$IMAGE" "$@"
+}
+
+tool()  { docker_run tty "$@"; }
+pipe()  { docker_run notty "$@"; }
+
+# ------------------------------------------------------ servers JSON file ---
+
+# Reads the servers JSON on stdin, writes the result on stdout.
+# ops: add <name> <zone> <machine_type|"">, remove <name>, has <name>, names
+read -r -d '' PY_SERVERS <<'PY' || true
+import json, sys
+op, args = sys.argv[1], sys.argv[2:]
+raw = sys.stdin.read().strip()
+try:
+    data = json.loads(raw) if raw else {}
+except ValueError as e:
+    sys.exit("servers JSON is not valid JSON: %s" % e)
+if not isinstance(data, dict):
+    sys.exit("servers JSON must be an object")
+servers = data.setdefault("servers", {})
+if not isinstance(servers, dict):
+    sys.exit('"servers" must be an object')
+if op == "add":
+    name, zone, mtype = args
+    entry = dict(servers.get(name) or {})
+    entry["zone"] = zone
+    if mtype:
+        entry["machine_type"] = mtype
+    servers[name] = entry
+elif op == "remove":
+    servers.pop(args[0], None)
+elif op == "has":
+    sys.exit(0 if args[0] in servers else 1)
+elif op == "names":
+    for n in sorted(servers):
+        print(n)
+    sys.exit(0)
+else:
+    sys.exit("unknown op " + op)
+json.dump(data, sys.stdout, indent=2, sort_keys=True)
+sys.stdout.write("\n")
+PY
+
+servers_query() { # servers_query has|names [name]
+  local src=/dev/null
+  [[ -f $SERVERS_JSON ]] && src=$SERVERS_JSON
+  pipe /work python3 -c "$PY_SERVERS" "$@" <"$src"
+}
+
+servers_edit() { # servers_edit add|remove args...
+  local src=/dev/null tmp
+  [[ -f $SERVERS_JSON ]] && src=$SERVERS_JSON
+  mkdir -p "$(dirname "$SERVERS_JSON")"
+  tmp="$(mktemp "$SERVERS_JSON.XXXXXX")"
+  if ! pipe /work python3 -c "$PY_SERVERS" "$@" <"$src" >"$tmp"; then
+    rm -f "$tmp"
+    die "could not update $SERVERS_JSON"
+  fi
+  chmod 0644 "$tmp"
+  mv "$tmp" "$SERVERS_JSON"
+}
+
+# ----------------------------------------------------------- tofu outputs ---
+
+# Runs inside the container (cwd /work/tofu).
+# ops: table, get <name> <field>
+read -r -d '' PY_TFOUT <<'PY' || true
+import json, os, subprocess, sys
+op, args = sys.argv[1], sys.argv[2:]
+p = subprocess.run(["tofu", "output", "-json", "servers"],
+                   capture_output=True, text=True)
+try:
+    deployed = json.loads(p.stdout) if p.returncode == 0 and p.stdout.strip() else {}
+except ValueError:
+    deployed = {}
+deployed = deployed or {}
+if op == "get":
+    name, field = args
+    v = (deployed.get(name) or {}).get(field)
+    if v is None:
+        sys.exit(1)
+    print(v)
+    sys.exit(0)
+conf = {}
+path = os.environ.get("SERVERS_JSON", "servers.auto.tfvars.json")
+if os.path.exists(path):
+    try:
+        conf = (json.load(open(path)) or {}).get("servers") or {}
+    except ValueError:
+        pass
+names = sorted(set(conf) | set(deployed))
+if not names:
+    print("No servers. Create one with: ./polvpn up <name> <zone>")
+    sys.exit(0)
+rows = [("NAME", "ZONE", "MACHINE", "IP", "STATUS")]
+for n in names:
+    c, d = conf.get(n) or {}, deployed.get(n) or {}
+    zone = c.get("zone") or d.get("zone") or "-"
+    status = "deployed"
+    if n not in deployed:
+        status = "pending (run sync)"
+    elif n not in conf:
+        status = "removing (run sync)"
+    elif d.get("zone") and d.get("zone") != zone:
+        status = "zone change pending"
+    rows.append((n, zone, c.get("machine_type", "e2-micro"), d.get("ip") or "-", status))
+w = [max(len(r[i]) for r in rows) for i in range(len(rows[0]))]
+for r in rows:
+    print("  ".join(v.ljust(w[i]) for i, v in enumerate(r)).rstrip())
+PY
+
+tf_out() { # tf_out table | tf_out get <name> <field>
+  pipe /work/tofu env "SERVERS_JSON=/work/${SERVERS_JSON#"$ROOT"/}" \
+    python3 -c "$PY_TFOUT" "$@"
+}
+
+# -------------------------------------------------------------- prechecks ---
+
+require_tofu_dir() {
+  compgen -G "$TF_DIR/*.tf" >/dev/null || die "no OpenTofu files in $TF_DIR"
+}
+
+require_project() {
+  [[ -n "$(project_id)" ]] || die "no GCP project configured. Run: ./polvpn init"
+}
+
+require_auth() {
+  [[ -f $SA_KEY || -f $ADC_FILE ]] ||
+    die "no Google Cloud credentials. Run './polvpn login' or put a service-account key at .secrets/gcp-sa.json"
+}
+
+require_ssh_key() {
+  [[ -f $ROOT/$SSH_KEY_REL && -f $ROOT/$SSH_KEY_REL.pub ]] ||
+    die "missing $SSH_KEY_REL(.pub). Run: ./polvpn init"
+}
+
+require_ready() {
+  ensure_image
+  require_tofu_dir
+  require_project
+  require_auth
+  require_ssh_key
+}
+
+admin_cidr() { # prints a validated CIDR list, comma separated
+  if [[ -n ${POLVPN_ADMIN_CIDR:-} ]]; then
+    local c
+    IFS=, read -r -a _cidrs <<<"$POLVPN_ADMIN_CIDR"
+    for c in "${_cidrs[@]}"; do
+      valid_cidr "$c" || die "POLVPN_ADMIN_CIDR: '$c' is not a CIDR like 203.0.113.7/32"
+    done
+    printf '%s\n' "$POLVPN_ADMIN_CIDR"
+    return 0
+  fi
+  command -v curl >/dev/null 2>&1 || die "curl not found; install it or set POLVPN_ADMIN_CIDR=<your ip>/32"
+  local url ip
+  for url in https://api.ipify.org https://ipv4.icanhazip.com https://checkip.amazonaws.com; do
+    ip="$(curl -4 -fsS --max-time 8 "$url" 2>/dev/null | tr -d '[:space:]')" || continue
+    if valid_ipv4 "$ip"; then
+      printf '%s/32\n' "$ip"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Sets TF_ADMIN_VAR to the -var argument for admin_cidrs.
+TF_ADMIN_VAR=""
+set_admin_var() {
+  local cidrs list="" c
+  if [[ -n ${POLVPN_ADMIN_CIDR:-} ]]; then
+    cidrs="$(admin_cidr)" || exit 1 # invalid override: error already printed
+  elif ! cidrs="$(admin_cidr)"; then
+    if [[ ${1:-} == optional ]]; then
+      warn "could not detect your public IP; using a placeholder (irrelevant for destroy)"
+      cidrs="127.0.0.1/32"
+    else
+      die "could not detect your public IP. Set POLVPN_ADMIN_CIDR=<your ip>/32 and retry."
+    fi
+  fi
+  IFS=, read -r -a _cidrs <<<"$cidrs"
+  for c in "${_cidrs[@]}"; do
+    list+="${list:+,}\"$c\""
+  done
+  info "SSH will be allowed from: $cidrs"
+  TF_ADMIN_VAR="admin_cidrs=[$list]"
+}
+
+tf_init_if_needed() {
+  if [[ ! -d $TF_DIR/.terraform ]]; then
+    info "tofu init"
+    tool /work/tofu tofu init -input=false
+  fi
+}
+
+tf_apply() {
+  tf_init_if_needed
+  info "tofu apply"
+  tool /work/tofu tofu apply -input=false -auto-approve -var "$TF_ADMIN_VAR"
+}
+
+ensure_collections() {
+  local req="$ANSIBLE_DIR/requirements.yml" stamp="$CACHE_DIR/ansible/requirements.sha256" h
+  [[ -f $req ]] || return 0
+  h="$(sha256 <"$req")"
+  if [[ -f $stamp && "$(cat "$stamp")" == "$h" ]]; then
+    return 0
+  fi
+  info "Installing Ansible requirements"
+  mkdir -p "$CACHE_DIR/ansible/collections" "$CACHE_DIR/ansible/roles"
+  tool /work/ansible ansible-galaxy install -r requirements.yml
+  printf '%s\n' "$h" >"$stamp"
+}
+
+run_playbook() {
+  [[ -f $ANSIBLE_DIR/site.yml ]] || die "missing $ANSIBLE_DIR/site.yml"
+  ensure_collections
+  info "ansible-playbook site.yml $*"
+  tool /work/ansible ansible-playbook site.yml "$@"
+}
+
+show_clients() { # show_clients <server>
+  local server=$1 dir="$CLIENTS_DIR/$1" conf base client
+  local -a confs=()
+  if [[ -d $dir ]]; then
+    for conf in "$dir"/*.conf; do
+      [[ -e $conf ]] && confs+=("$conf")
+    done
+  fi
+  if ((${#confs[@]} == 0)); then
+    warn "no client configs found in clients/$server/"
+    return 0
+  fi
+  for conf in "${confs[@]}"; do
+    base=${conf%.conf}
+    client=${base##*/}
+    printf '\n%s== %s / %s ==%s\n' "$C_BLU" "$server" "$client" "$C_OFF"
+    printf '  config: clients/%s/%s.conf\n' "$server" "$client"
+    [[ -f $base.png ]] && printf '  QR png: clients/%s/%s.png\n' "$server" "$client"
+    [[ -f $base.qr.txt ]] && cat "$base.qr.txt"
+  done
+  printf '\n'
+}
+
+# --------------------------------------------------------------- commands ---
+
+cmd_help() {
+  cat <<'EOF'
+polvpn - personal WireGuard VPN servers on Google Cloud
+
+Usage: ./polvpn <command> [args]
+
+Setup
+  init [project-id]          build the toolbox, create the SSH key, set the GCP project,
+                             run tofu init
+  login                      sign in to Google Cloud (copy/paste URL flow)
+
+Servers
+  up <name> <zone> [type]    create/update a server and configure WireGuard; prints
+                             client configs and QR codes. type: e2-*, n1-*, n2-* or
+                             n2d-*; without it a new server gets e2-micro and an
+                             existing server keeps its current type
+  down <name>                delete one server and its client files
+  list                       show configured and deployed servers
+  sync [name]                re-apply OpenTofu + Ansible (after editing wg_clients,
+                             or when your IP changed and SSH is blocked)
+  destroy                    delete ALL cloud resources (asks for confirmation)
+
+Clients and tools
+  qr <server> <client>       print a client's QR code
+  zones                      list available GCP zones
+  ssh <name> [ssh args]      SSH into a server
+  shell [cmd...]             open a shell (or run a command) in the toolbox
+  help                       this help
+
+Names: lowercase letters, digits and '-', start with a letter, max 20 chars.
+Clients are defined in ansible/group_vars/all.yml (wg_clients).
+
+Environment
+  POLVPN_ADMIN_CIDR   CIDR(s) allowed to SSH, comma separated (default: your public IPv4/32)
+  POLVPN_PROJECT      project id for 'init' (instead of prompting)
+  POLVPN_ASSUME_YES=1 skip the confirmation in 'destroy'
+  POLVPN_REBUILD=1    force a rebuild of the toolbox image
+EOF
+}
+
+cmd_init() {
+  local project=${1:-${POLVPN_PROJECT:-}}
+  ensure_image
+
+  mkdir -p "$SECRETS"
+  chmod 700 "$SECRETS"
+  if [[ ! -f $ROOT/$SSH_KEY_REL ]]; then
+    info "Generating SSH key $SSH_KEY_REL"
+    pipe /work ssh-keygen -q -t ed25519 -N '' -C polvpn -f "/work/$SSH_KEY_REL"
+  fi
+  touch "$SECRETS/known_hosts"
+  chmod 600 "$SECRETS/known_hosts"
+
+  local current
+  current="$(project_id)"
+  if [[ -z $project ]]; then
+    if [[ -t 0 ]]; then
+      read -r -p "GCP project id${current:+ [$current]}: " project
+      project=${project:-$current}
+    else
+      project=$current
+    fi
+  fi
+  [[ -n $project ]] || die "no project id given. Usage: ./polvpn init <project-id>"
+  valid_project "$project" || die "'$project' is not a valid GCP project id (6-30 chars: a-z, 0-9, '-')"
+
+  [[ -d $TF_DIR ]] || die "missing $TF_DIR"
+  local tmp
+  tmp="$(mktemp "$TFVARS.XXXXXX")"
+  {
+    printf 'project_id = "%s"\n' "$project"
+    [[ -f $TFVARS ]] && grep -v '^[[:space:]]*project_id[[:space:]]*=' "$TFVARS" || true
+  } >"$tmp"
+  chmod 0644 "$tmp"
+  mv "$tmp" "$TFVARS"
+  info "Project set to $project ($TFVARS)"
+
+  require_tofu_dir
+  info "tofu init"
+  tool /work/tofu tofu init -input=false
+  ensure_collections
+
+  if [[ ! -f $SA_KEY && ! -f $ADC_FILE ]]; then
+    info "Next: ./polvpn login   (or put a service-account key at .secrets/gcp-sa.json)"
+  else
+    info "Next: ./polvpn up <name> <zone>   e.g. ./polvpn up fra europe-west3-a"
+  fi
+}
+
+cmd_login() {
+  ensure_image
+  mkdir -p "$SECRETS"
+  chmod 700 "$SECRETS"
+  if [[ -f $SA_KEY ]]; then
+    warn ".secrets/gcp-sa.json exists and takes precedence over the login credentials"
+  fi
+  SKIP_CREDS=1
+  info "Signing in to Google Cloud (open the URL, then paste the code back here)"
+  # --update-adc also writes Application Default Credentials (used by
+  # OpenTofu), so one sign-in covers both gcloud and OpenTofu.
+  tool /work gcloud auth login --no-launch-browser --update-adc
+  local project
+  project="$(project_id)"
+  if [[ -n $project ]]; then
+    tool /work gcloud config set project "$project" >/dev/null 2>&1 || true
+    if ! tool /work gcloud auth application-default set-quota-project "$project"; then
+      warn "could not set the ADC quota project; this is usually harmless (rerun 'login' after the first 'up')"
+    fi
+  else
+    warn "no project configured yet; run './polvpn init' and then './polvpn login' again to set the quota project"
+  fi
+}
+
+cmd_up() {
+  need_arg 2 $# "up <name> <zone> [machine_type]"
+  (($# <= 3)) || die "usage: polvpn up <name> <zone> [machine_type]"
+  local name=$1 zone=$2 mtype=${3:-}
+  valid_name "$name" || die "invalid server name '$name' (lowercase letters, digits, '-', start with a letter, max 20 chars)"
+  valid_zone "$zone" || die "invalid zone '$zone' (expected something like europe-west3-a; see './polvpn zones')"
+  [[ -z $mtype ]] || valid_machine "$mtype" ||
+    die "invalid machine type '$mtype': use the e2, n1, n2 or n2d family (e.g. e2-micro, e2-small, n2d-standard-2)"
+  require_ready
+  set_admin_var
+  servers_edit add "$name" "$zone" "$mtype"
+  info "Server '$name' -> $zone${mtype:+ ($mtype)}"
+  tf_apply
+  run_playbook --limit "$name"
+  show_clients "$name"
+}
+
+cmd_down() {
+  need_arg 1 $# "down <name>"
+  local name=$1 ip="" iid=""
+  valid_name "$name" || die "invalid server name '$name'"
+  require_ready
+  if ! servers_query has "$name"; then
+    die "no server named '$name' (see './polvpn list')"
+  fi
+  ip="$(tf_out get "$name" ip 2>/dev/null)" || ip=""
+  iid="$(tf_out get "$name" instance_id 2>/dev/null)" || iid=""
+  set_admin_var
+  servers_edit remove "$name"
+  tf_apply
+  if [[ -f $SECRETS/known_hosts ]]; then
+    # Host keys are pinned under HostKeyAlias polvpn-<name>-<instance_id>;
+    # older versions pinned them under the IP.
+    local h
+    for h in ${iid:+"polvpn-$name-$iid"} ${ip:+"$ip"}; do
+      pipe /work ssh-keygen -R "$h" -f /work/.secrets/known_hosts >/dev/null 2>&1 || true
+    done
+    rm -f "$SECRETS/known_hosts.old"
+  fi
+  rm -rf "${CLIENTS_DIR:?}/$name"
+  info "Server '$name' removed"
+}
+
+cmd_list() {
+  ensure_image
+  require_tofu_dir
+  tf_out table
+}
+
+cmd_sync() {
+  local name=${1:-}
+  local -a limit=()
+  if [[ -n $name ]]; then
+    valid_name "$name" || die "invalid server name '$name'"
+  fi
+  require_ready
+  if [[ -n $name ]]; then
+    servers_query has "$name" || die "no server named '$name' (see './polvpn list')"
+    limit=(--limit "$name")
+  fi
+  local -a names=()
+  mapfile -t names < <(servers_query names)
+  set_admin_var
+  tf_apply
+  if ((${#names[@]} == 0)); then
+    info "No servers configured; nothing to configure with Ansible"
+    return 0
+  fi
+  run_playbook "${limit[@]}"
+  if [[ -n $name ]]; then
+    show_clients "$name"
+  else
+    local n
+    for n in "${names[@]}"; do show_clients "$n"; done
+  fi
+}
+
+cmd_qr() {
+  need_arg 2 $# "qr <server> <client>"
+  local server=$1 client=$2
+  valid_name "$server" || die "invalid server name '$server'"
+  valid_client "$client" || die "invalid client name '$client'"
+  local f="$CLIENTS_DIR/$server/$client.qr.txt"
+  if [[ ! -f $f ]]; then
+    local avail=""
+    if [[ -d $CLIENTS_DIR/$server ]]; then
+      avail="$(find "$CLIENTS_DIR/$server" -maxdepth 1 -name '*.qr.txt' -exec basename {} .qr.txt \; | sort | tr '\n' ' ')"
+    fi
+    die "no QR for client '$client' on server '$server'${avail:+ (available: $avail)}"
+  fi
+  cat "$f"
+  printf 'config: clients/%s/%s.conf\n' "$server" "$client"
+}
+
+cmd_zones() {
+  ensure_image
+  require_project
+  require_auth
+  tool /work gcloud compute zones list \
+    --format='table(name,region.basename():label=REGION,status)' --sort-by=name
+  cat <<'EOF'
+
+Pick a zone close to you (lower latency) or in the country you want to appear from.
+The always-free e2-micro is only available in us-west1, us-central1 and us-east1.
+(If this fails with "API not enabled", run './polvpn up' once; OpenTofu enables the Compute API.)
+EOF
+}
+
+cmd_ssh() {
+  need_arg 1 $# "ssh <name> [ssh args...]"
+  local name=$1 ip user iid
+  shift
+  valid_name "$name" || die "invalid server name '$name'"
+  ensure_image
+  require_ssh_key
+  ip="$(tf_out get "$name" ip)" || die "server '$name' is not deployed (see './polvpn list')"
+  user="$(tf_out get "$name" ssh_user)" || user=polvpn
+  # Host keys are pinned per instance (same alias as the Ansible inventory). The
+  # instance_id output only exists after an apply with this version; until then
+  # fall back to pinning by IP.
+  local -a alias=()
+  iid="$(tf_out get "$name" instance_id)" && alias=(-o "HostKeyAlias=polvpn-$name-$iid")
+  tool /work ssh -i "/work/$SSH_KEY_REL" -o IdentitiesOnly=yes \
+    -o UserKnownHostsFile=/work/.secrets/known_hosts -o StrictHostKeyChecking=accept-new \
+    "${alias[@]}" "$user@$ip" "$@"
+}
+
+cmd_destroy() {
+  require_ready
+  local project
+  project="$(project_id)"
+  if [[ ${POLVPN_ASSUME_YES:-0} != 1 ]]; then
+    confirm_tty
+    printf '%sThis deletes ALL polvpn servers and cloud resources in project %s.%s\n' "$C_RED" "$project" "$C_OFF" >&2
+    local answer
+    read -r -p "Type the project id to confirm: " answer
+    [[ $answer == "$project" ]] || die "aborted"
+  fi
+  set_admin_var optional
+  tf_init_if_needed
+  info "tofu destroy"
+  tool /work/tofu tofu destroy -input=false -auto-approve -var "$TF_ADMIN_VAR"
+  # Clear local state that referred to the destroyed servers.
+  local -a names=()
+  mapfile -t names < <(servers_query names)
+  local n
+  for n in "${names[@]}"; do servers_edit remove "$n"; done
+  rm -rf "${CLIENTS_DIR:?}"
+  rm -f "$SECRETS/known_hosts.old"
+  [[ -f $SECRETS/known_hosts ]] && : >"$SECRETS/known_hosts"
+  info "Everything destroyed. Your SSH key and project settings are kept in .secrets/ and tofu/terraform.tfvars."
+}
+
+cmd_shell() {
+  ensure_image
+  if (($# == 0)); then
+    tool /work bash
+  else
+    tool /work "$@"
+  fi
+}
+
+main() {
+  local cmd=${1:-help}
+  (($# > 0)) && shift
+  case $cmd in
+    init) cmd_init "$@" ;;
+    login) cmd_login "$@" ;;
+    up) cmd_up "$@" ;;
+    down) cmd_down "$@" ;;
+    list | ls) cmd_list "$@" ;;
+    sync) cmd_sync "$@" ;;
+    qr) cmd_qr "$@" ;;
+    zones) cmd_zones "$@" ;;
+    ssh) cmd_ssh "$@" ;;
+    destroy) cmd_destroy "$@" ;;
+    shell) cmd_shell "$@" ;;
+    help | -h | --help) cmd_help ;;
+    *) cmd_help >&2; die "unknown command '$cmd'" ;;
+  esac
+}
+
+main "$@"

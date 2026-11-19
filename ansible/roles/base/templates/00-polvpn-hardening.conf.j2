@@ -1,0 +1,10 @@
+# {{ ansible_managed }}
+# Key-only authentication, no root login. Users and keys are managed by
+# google-guest-agent from instance metadata (ssh-keys); nothing here restricts that.
+PermitRootLogin no
+PubkeyAuthentication yes
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitEmptyPasswords no
+X11Forwarding no
+MaxAuthTries 4

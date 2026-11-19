@@ -1,0 +1,4 @@
+---
+# Reboot automatically (at 04:00) when a security update needs it. Off by default:
+# a reboot briefly drops the VPN.
+base_unattended_reboot: false

@@ -1,0 +1,50 @@
+---
+- name: Validate global WireGuard settings
+  ansible.builtin.assert:
+    that:
+      - wg_clients is sequence and wg_clients is not string
+      - wg_subnet is string and wg_subnet is match('^(25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])(\.(25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])){2}\.0/24$')
+      - (wg_port | string) is match('^[0-9]+$') and (wg_port | int) >= 1 and (wg_port | int) <= 65535
+      - (wg_mtu | string) is match('^[0-9]+$') and (wg_mtu | int) >= 1280 and (wg_mtu | int) <= 1420
+      - wg_dns is sequence and wg_dns is not string and (wg_dns | length) > 0
+      - ansible_facts['default_ipv4']['interface'] is defined
+    fail_msg: >-
+      Invalid settings: wg_clients must be a list, wg_subnet an IPv4 /24 ending in .0
+      (got {{ wg_subnet }}), wg_port 1-65535 (got {{ wg_port }}), wg_mtu 1280-1420
+      (got {{ wg_mtu }}), wg_dns a non-empty list, and the host needs a default IPv4 route.
+    quiet: true
+
+- name: Validate each client entry
+  ansible.builtin.assert:
+    that:
+      - item is mapping
+      - item.name is defined and item.name is string
+      - item.name is match('^[A-Za-z0-9_-]{1,32}$')
+      - item.id is defined and (item.id | string) is match('^[0-9]+$')
+      - (item.id | int) >= 2 and (item.id | int) <= 254
+    fail_msg: >-
+      Invalid wg_clients entry {{ item }}: name must be 1-32 characters of
+      letters, digits, '_' or '-', and id an integer from 2 to 254.
+    quiet: true
+  loop: "{{ wg_clients }}"
+  loop_control:
+    label: "{{ item.name | default(item) }}"
+
+- name: Validate that client names and ids are unique
+  vars:
+    _names: "{{ wg_clients | map(attribute='name') | list }}"
+    _ids: "{{ wg_clients | map(attribute='id') | map('int') | list }}"
+  ansible.builtin.assert:
+    that:
+      - (_names | unique | length) == (_names | length)
+      - (_ids | unique | length) == (_ids | length)
+    fail_msg: "wg_clients names and ids must be unique (names: {{ _names }}, ids: {{ _ids }})."
+    quiet: true
+
+- name: Derive addresses and paths
+  ansible.builtin.set_fact:
+    wg_net_prefix: "{{ wg_subnet | regex_replace('\\.0/24$', '') }}"
+    wg_server_address: "{{ wg_subnet | regex_replace('\\.0/24$', '.1') }}"
+    wg_egress_interface: "{{ ansible_facts['default_ipv4']['interface'] }}"
+    wg_client_names: "{{ wg_clients | map(attribute='name') | list }}"
+    wg_clients_dir: "{{ wg_config_dir }}/clients"

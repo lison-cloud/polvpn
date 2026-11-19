@@ -1,0 +1,35 @@
+# Secrets: SSH key, known_hosts, gcloud config + Application Default Credentials,
+# optional service-account key.
+.secrets/
+*.json.key
+gcp-sa*.json
+
+# Generated WireGuard client configs and QR codes (contain private keys).
+clients/
+
+# Local caches (Ansible collections installed by ./polvpn).
+.cache/
+
+# OpenTofu: working dir, state, per-user inputs. Keep .terraform.lock.hcl.
+tofu/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+*.tfplan.json
+crash.log
+crash.*.log
+tofu/terraform.tfvars
+tofu/servers.auto.tfvars.json
+!tofu/.terraform.lock.hcl
+
+# Ansible: generated inventory and run artefacts.
+ansible/inventory/hosts.yml
+*.retry
+ansible/fact_cache/
+
+# Editors / OS
+.DS_Store
+*.swp
+*~
+.idea/
+.vscode/

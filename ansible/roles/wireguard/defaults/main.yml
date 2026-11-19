@@ -1,0 +1,20 @@
+---
+# Internal defaults. User-facing settings live in group_vars/all.yml.
+
+# Start/enable wg-quick@wg0 and apply config changes to the running interface.
+# Only tests set this to false (containers without the wireguard kernel module).
+wg_manage_service: true
+
+# Where key material and client configs live on the server.
+wg_config_dir: /etc/wireguard
+
+# Where client configs/QR codes are written on the control machine.
+wg_local_clients_dir: "{{ playbook_dir | dirname }}/clients/{{ inventory_hostname }}"
+
+# Fallbacks in case group_vars/all.yml is missing.
+wg_clients: []
+wg_subnet: 10.66.66.0/24
+wg_dns: [1.1.1.1, 1.0.0.1]
+wg_mtu: 1380
+wg_port: 51820
+wg_persistent_keepalive: 25

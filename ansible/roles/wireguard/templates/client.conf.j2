@@ -1,0 +1,12 @@
+[Interface]
+PrivateKey = {{ wg_keys[wg_clients_dir ~ '/' ~ item.name ~ '/private.key'] }}
+Address = {{ wg_net_prefix }}.{{ item.id | int }}/32
+DNS = {{ wg_dns | join(', ') }}
+MTU = {{ wg_mtu }}
+
+[Peer]
+PublicKey = {{ wg_keys[wg_config_dir ~ '/server.pub'] }}
+PresharedKey = {{ wg_keys[wg_clients_dir ~ '/' ~ item.name ~ '/preshared.key'] }}
+Endpoint = {{ ansible_host }}:{{ wg_port }}
+AllowedIPs = 0.0.0.0/0, ::/0
+PersistentKeepalive = {{ wg_persistent_keepalive }}

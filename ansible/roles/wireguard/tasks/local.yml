@@ -1,0 +1,47 @@
+---
+# Runs on the control machine (inside the polvpn toolbox container).
+- name: Create local client directory
+  ansible.builtin.file:
+    path: "{{ wg_local_clients_dir }}"
+    state: directory
+    mode: "0700"
+  delegate_to: localhost
+  become: false
+
+- name: Fetch client configs and QR codes
+  ansible.builtin.fetch:
+    src: "{{ wg_clients_dir }}/{{ item.0 }}/{{ item.0 }}.{{ item.1 }}"
+    dest: "{{ wg_local_clients_dir }}/{{ item.0 }}.{{ item.1 }}"
+    flat: true
+  loop: "{{ wg_client_names | product(['conf', 'png', 'qr.txt']) | list }}"
+  loop_control:
+    label: "{{ item.0 }}.{{ item.1 }}"
+
+- name: Restrict local client file permissions
+  ansible.builtin.file:
+    path: "{{ wg_local_clients_dir }}/{{ item.0 }}.{{ item.1 }}"
+    mode: "0600"
+  loop: "{{ wg_client_names | product(['conf', 'png', 'qr.txt']) | list }}"
+  loop_control:
+    label: "{{ item.0 }}.{{ item.1 }}"
+  delegate_to: localhost
+  become: false
+
+- name: Find local client files
+  ansible.builtin.find:
+    paths: "{{ wg_local_clients_dir }}"
+    patterns: ["*.conf", "*.png", "*.qr.txt"]
+  delegate_to: localhost
+  become: false
+  register: wg_local_files
+
+- name: Delete local files of removed clients
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: absent
+  loop: "{{ wg_local_files.files }}"
+  loop_control:
+    label: "{{ item.path | basename }}"
+  when: (item.path | basename | regex_replace('\.(qr\.txt|conf|png)$', '')) not in wg_client_names
+  delegate_to: localhost
+  become: false
